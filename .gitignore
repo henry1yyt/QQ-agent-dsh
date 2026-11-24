@@ -56,3 +56,6 @@ release/
 community.key
 
 .goal-baseline/
+
+# 「指令前置」插件的运行态旗标（每台机器各自生成，不进版本库）
+plugins/**/patch-on-boot.flag

@@ -922,6 +922,130 @@ export function createApp({ log = console.log } = {}) {
       });
     const atNames = atMarks.map((m) => String(m?.text || '')).filter(Boolean);
 
+
+    // ── [[command-gateway:dispatch]] 「指令前置」插件自动维护，不要手改这一段 ──
+    // ── 指令前置：在存档与会话创建之前，给「指令前置」插件一次认领机会 ──
+    // 约定（见 plugins/command-gateway/README.md）：
+    //   · dispatch 必须**同步**返回 { handled }；认领后要做的异步工作放进 run()，
+    //     这样消息热路径不等待网络/模型调用；
+    //   · handled = true → 不存档、不触发会话，彻底不诞生这条会话；
+    //   · run() 还可以再返回 { passthrough } 表达「指令执行完后放行」：
+    //       true         → 按消息原文放行（存档 + 触发会话，和没认领过一样）；
+    //       非空字符串   → 用这段文本替代原文放行（修改后再进会话）；
+    //       false / 缺省 → 不放行，消息到此为止。
+    //     放行走的是下面的 releaseClaimed()：**不重新过拦截链**（防止链上插件
+    //     二次认领造成循环），但指令禁言检查、链接媒体转发这些常规动作照常执行，
+    //     原消息的媒体段原样保留。
+    //   · 未认领、插件没装、插件抛错 → 一律原样放行，行为与没装插件完全一致。
+    try {
+      const dispatch = skillManager.getCapabilityProviders('command.dispatch')[0]?.fn;
+      if (dispatch) {
+        const chatKey = `${kind}:${id}`;
+        // 指令目录：只取「声明了 command 的插件」的清单元信息，不做可用性计算
+        //（用 registry.list() 而不是 skillManager.list()，避免每条消息都跑一遍
+        //  isActive 依赖链）。插件自己会用 api.hasCapability 判断能力是否可用。
+        const catalog = skillManager.registry.list()
+          .map((s) => ({
+            id: s?.manifest?.id,
+            name: s?.manifest?.name,
+            commands: Array.isArray(s?.manifest?.commands) ? s.manifest.commands : [],
+            // 消息入口拦截声明：{ capability, order }（见 manifest.js 的 normalizeIntercept）
+            intercept: s?.manifest?.intercept || null
+          }))
+          .filter((s) => s.id && (s.commands.length || s.intercept));
+        const decision = dispatch({
+          text,
+          segments,
+          rawMessage: String(event.raw_message ?? (typeof event.message === 'string' ? event.message : '') ?? ''),
+          messageId: event.message_id != null ? String(event.message_id) : '',
+          kind,
+          chatId: String(id),
+          chatKey,
+          senderId,
+          senderName,
+          catalog,
+          // v6：@ 判定标记透传（0.4.0-bugfix 起核心在入口算 atMe/atNames）。
+          // 旧核心没有这两个变量 —— typeof 守卫，求值不到就不透传，子插件照旧用 payload.ats。
+          ...(typeof atMe === 'boolean' ? { atMe, atNames } : {}),
+          ctx: {
+            kind, chatId: String(id), chatKey, onebot, sender, store, memory, log, emit,
+            // 核心句柄：给「指令前置」把它包装成对外服务能力（ai.ask / search.web / history.read…）。
+            // 插件不该自己 import src/，所以由核心在这一处把实例交出去。
+            // chat 单独再给一份：链上的拦截者（比如隐私模式）要"用核心的模型链路问一次 AI"，
+            // 这个口子以前是它自己插补丁时自带的，现在由调用点统一提供。
+            host: {
+              store, sessions, reminders, stickers, sender, onebot, orchestrator, memory, emit, log,
+              dataDir: DATA_DIR,
+              getConfig, updateConfig,
+              chat: (messages, options = {}) => import('./llm.js').then((m) => m.chatCompletionWithRetry({
+                messages,
+                temperature: options.temperature ?? null,
+                maxTokens: Number(options.maxTokens) || 0
+              })),
+              search: (query) => import('./web-search.js').then((m) => m.webSearch(query)),
+              personas: () => import('./personas.js').then((m) => m.PERSONAS)
+            },
+            chat: (messages, options = {}) => import('./llm.js').then((m) => m.chatCompletionWithRetry({
+              messages,
+              temperature: options.temperature ?? null,
+              maxTokens: Number(options.maxTokens) || 0
+            }))
+          }
+        });
+        if (decision && decision.handled === true) {
+          if (typeof decision.run === 'function') {
+            Promise.resolve()
+              .then(() => decision.run())
+              .then((r) => releaseClaimed(kind, id, text, media, event, senderId, senderName, r))
+              .catch((error) => log(`[指令前置] 执行失败：${error?.message ?? error}`));
+          }
+          return;
+        }
+      }
+    } catch (error) {
+      log(`[指令前置] 分发失败，已按普通消息放行：${error?.message ?? error}`);
+    }
+
+    /**
+     * 「执行完后放行」：把已认领的消息按插件的要求放回正常聊天流程。
+     * 独立成函数声明，是为了让上面那条 Promise 链在 try 块结束之后仍能调到它。
+     * 顺序说明：指令的回复此刻多半已经发出并入档（appendSelf），这里补存的是
+     * 用户那条原始消息 —— 存档时间用消息本来的时间，不用现在，避免历史错序。
+     */
+    function releaseClaimed(kind, id, text, media, event, senderId, senderName, result) {
+      const pass = result ? result.passthrough : undefined;
+      if (pass === undefined || pass === null || pass === false) return;
+      let body;
+      if (pass === true) {
+        body = String(text ?? '');
+      } else {
+        body = String(pass).trim();
+        if (!body) {
+          log('[指令前置] 放行文本为空，已忽略本次放行');
+          return;
+        }
+      }
+      const chatKey = `${kind}:${id}`;
+      if (kind === 'group') {
+        maybeTriggerCommandMute(id, body, event, typeof atMe === 'boolean' ? atMe : null);
+      }
+      // v6：接住 appendIncoming 的返回值传给 onIncoming —— bugfix 的编排器用它
+      // 精确标"这条已读"；旧核心的 onIncoming 只认一个参数，多传的会被忽略。
+      const entry = store.appendIncoming(chatKey, {
+        mid: event?.message_id,
+        ts: event?.time ? Math.round(Number(event.time) * 1000) : Date.now(),
+        senderId,
+        senderName,
+        text: body || '[图片]',
+        media,
+        ...(typeof atMe === 'boolean' ? { atMe, atNames } : {})
+      });
+      emit('chat-update', chatKey);
+      orchestrator.onIncoming(chatKey, entry);
+      forwardLinkedMedia(kind, id, body).catch((e) => log(`[media] 链接转发失败：${e?.message ?? e}`));
+    }
+    // ── [[/command-gateway:dispatch]] ──
+
     // ── 指令禁言：群内任何人 @机器人 + 发送指定指令 → 该群暂时固定 1 档（仅艾特）──
     // 在存档前处理：指令本身也要留档（让机器人知道被禁言了），但先设置禁言状态。
     if (kind === 'group') {
@@ -1400,6 +1524,67 @@ export function createApp({ log = console.log } = {}) {
       return json(res, 404, { error: `未知 API：${method} ${pathname}` });
     }
 
+
+
+
+    // ── [[command-gateway:plugin-assets]] 「指令前置」插件自动维护，不要手改这一段 ──
+    // 插件自带的静态资源：/plugin-assets/<插件id>/<文件>
+    //
+    // 用途：插件把自己的设置页模块（settings-ui.js）放在插件目录里，由控制台动态加载。
+    // 安全约束与下面 UI 目录同一套，只是根目录换成「那个插件自己的目录」：
+    //   1. 插件 id 必须对应一个**已注册**的插件（不存在的 id 直接 404，不猜路径）；
+    //   2. 文件路径逐段校验，拒绝 ..、控制字符，拼好后再用 path.relative 二次确认没跳出目录；
+    //   3. no-cache：插件文件是开发期会频繁改的东西，不能吃浏览器缓存。
+    if (req.method === 'GET' && pathname.startsWith('/plugin-assets/')) {
+      const rest = pathname.slice('/plugin-assets/'.length);
+      const cut = rest.indexOf('/');
+      let id = '';
+      let file = '';
+      try {
+        id = decodeURIComponent(cut >= 0 ? rest.slice(0, cut) : '');
+        file = decodeURIComponent(cut >= 0 ? rest.slice(cut + 1) : '');
+      } catch {
+        res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Bad Request');
+        return;
+      }
+      const entry = id ? skillManager.registry.get(id) : null;
+      const dir = entry?.dir ? path.resolve(ROOT, entry.dir) : '';
+      const segs = file.split(/[/\\]+/).filter((s) => s !== '' && s !== '.');
+      const bad = !entry || !dir || !segs.length
+        || segs.some((s) => s === '..' || /[\x00-\x1f]/.test(s));
+      const fullPath = bad ? '' : path.join(dir, ...segs);
+      const relCheck = fullPath ? path.relative(dir, fullPath) : '..';
+      if (bad || relCheck === '' || relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
+        return;
+      }
+      try {
+        const data = fs.readFileSync(fullPath);
+        const ext = path.extname(fullPath);
+        const assetTypes = {
+          '.js': 'text/javascript; charset=utf-8',
+          '.mjs': 'text/javascript; charset=utf-8',
+          '.css': 'text/css; charset=utf-8',
+          '.json': 'application/json; charset=utf-8',
+          '.svg': 'image/svg+xml',
+          '.png': 'image/png'
+        };
+        res.writeHead(200, {
+          'content-type': assetTypes[ext] ?? 'application/octet-stream',
+          'cache-control': 'no-cache'
+        });
+        res.end(data);
+        return;
+      } catch {
+        res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
+        return;
+      }
+    }
+
+    // ── [[/command-gateway:plugin-assets]] ──
 
     // 静态 UI
     if (req.method === 'GET') {
